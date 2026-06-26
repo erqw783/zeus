@@ -235,7 +235,60 @@ const Router = {
         status: 401, headers: { "Content-Type": "application/json; charset=utf-8" } 
       });
     }
+// API: آپدیت خودکار پنل زئوس
+    if (url.pathname === '/api/update-panel' && request.method === 'POST') {
+      if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) {
+        return new Response(JSON.stringify({ error: "توکن یا اکانت آیدی کلودفلر تنظیم نشده است." }), { status: 400, headers: { "Content-Type": "application/json" } });
+      }
+      try {
+        const githubRes = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=" + Date.now());
+        if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب");
+        const newCode = await githubRes.text();
 
+        const scriptName = env.WORKER_NAME || url.hostname.split('.')[0];
+
+        const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}/bindings`, { 
+            headers: { "Authorization": "Bearer " + env.CF_API_TOKEN } 
+        });
+        const bindingsData = await bindingsRes.json();
+        
+        if (!bindingsData.success) throw new Error("عدم دسترسی به تنظیمات ورکر. توکن نامعتبر است.");
+
+        const newBindings = [];
+        for (const b of bindingsData.result) {
+            if (b.type === 'd1') {
+                newBindings.push({ type: 'd1', name: b.name, id: b.database_id || b.id });
+            } else if (b.name === 'CF_API_TOKEN') {
+                newBindings.push({ type: 'secret_text', name: 'CF_API_TOKEN', text: env.CF_API_TOKEN });
+            } else if (b.name === 'CF_ACCOUNT_ID') {
+                newBindings.push({ type: 'secret_text', name: 'CF_ACCOUNT_ID', text: env.CF_ACCOUNT_ID });
+            }
+        }
+
+        const metadata = {
+            main_module: "zeus.js",
+            compatibility_date: "2024-02-08",
+            bindings: newBindings
+        };
+
+        const formData = new FormData();
+        formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+        formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
+
+        const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}`, {
+            method: 'PUT',
+            headers: { "Authorization": "Bearer " + env.CF_API_TOKEN },
+            body: formData
+        });
+        
+        const deployData = await deployRes.json();
+        if (!deployData.success) throw new Error("خطا در اعمال آپدیت در کلودفلر.");
+
+        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+      }
+    }
     // API: تغییر رمز عبور مدیریت
     if (url.pathname === '/api/change-password' && request.method === 'POST') {
       const { current_password, new_password } = await request.json();
@@ -1898,7 +1951,7 @@ const HTML_TEMPLATES = {
             <div class="flex flex-col sm:flex-row sm:items-center gap-3">
                 <h1 class="text-lg font-bold flex items-center gap-2" dir="ltr">
                     ZEUS Panel 
-                    <span class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v1.2.1</span>
+                    <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v1.2.2</span>
                 </h1>
                 <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-sm flex-shrink-0 w-fit">
                     <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" rel="noopener noreferrer" class="text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="گیت‌هاب">
@@ -1919,6 +1972,10 @@ const HTML_TEMPLATES = {
                     <svg id="sun-icon" class="w-5 h-5 hidden dark:block text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M14 12a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
                     <svg id="moon-icon" class="w-5 h-5 block dark:hidden text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
                 </button>
+<button id="update-toggle" onclick="checkUpdateManual()" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition text-gray-600 dark:text-gray-300 relative" title="بررسی آپدیت">
+    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.253 8H18"></path></svg>
+    <span id="update-badge" class="absolute top-1 right-1 w-2 h-2 bg-orange-500 rounded-full hidden animate-pulse"></span>
+</button>				
                 <button onclick="toggleSettingsModal(true)" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition text-gray-600 dark:text-gray-300 shadow-sm" title="تنظیمات">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
                 </button>
@@ -3167,12 +3224,75 @@ const HTML_TEMPLATES = {
                 window.location.reload();
             }
         }
+const CURRENT_VERSION = '1.1.1';
 
+        async function checkForUpdates(isManual = false) {
+            try {
+                if (isManual) {
+                    document.getElementById('update-toggle').classList.add('animate-pulse');
+                }
+                
+                const res = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=' + Date.now());
+                if (!res.ok) throw new Error('Network response was not ok');
+                const text = await res.text();
+                
+                const match = text.match(/ZEUS Panel[\s\S]*?>v?(\d+\.\d+\.\d+)<\/span>/i);
+                const latestVersion = match ? match[1] : null;
+
+                if (isManual) {
+                    document.getElementById('update-toggle').classList.remove('animate-pulse');
+                }
+
+                if (latestVersion && latestVersion !== CURRENT_VERSION) {
+                    document.getElementById('update-badge').classList.remove('hidden');
+                    if (isManual) {
+                        if (confirm('نسخه جدید (v' + latestVersion + ') در دسترس است! آیا می‌خواهید پنل را آپدیت کنید؟ (اطلاعات کاربران پاک نمی‌شود)')) {
+                            applyUpdate();
+                        }
+                    }
+                } else {
+                    if (isManual) {
+                        alert('شما در حال استفاده از آخرین نسخه (v' + CURRENT_VERSION + ') هستید.');
+                    }
+                }
+            } catch (err) {
+                if (isManual) {
+                    document.getElementById('update-toggle').classList.remove('animate-pulse');
+                    alert('خطا در بررسی آپدیت از گیت‌هاب.');
+                }
+            }
+        }
+
+        async function applyUpdate() {
+            const btn = document.getElementById('update-toggle');
+            btn.disabled = true;
+            alert('در حال دریافت و اعمال آپدیت... لطفاً چند ثانیه صبر کنید و صفحه را نبندید.');
+            
+            try {
+                const res = await fetch('/api/update-panel', { method: 'POST' });
+                const data = await res.json();
+                
+                if (res.ok && data.success) {
+                    alert('پنل با موفقیت به آخرین نسخه آپدیت شد! صفحه اکنون رفرش می‌شود.');
+                    window.location.reload();
+                } else {
+                    alert('خطا در آپدیت پنل: ' + (data.error || 'نامشخص'));
+                    btn.disabled = false;
+                }
+            } catch (err) {
+                alert('خطا در برقراری ارتباط با سرور برای آپدیت.');
+                btn.disabled = false;
+            }
+        }
         document.addEventListener('DOMContentLoaded', () => {
+            const versionBadge = document.getElementById('panel-version');
+            if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION;
+
             renderPortCheckboxes();
             loadUsers();
             loadLocations();
             setInterval(() => loadUsers(true), 60000);
+            setTimeout(() => checkForUpdates(false), 2000);
         });
     </script>
 </body>
