@@ -9,6 +9,8 @@ const GLOBAL_LAST_ACTIVE_WRITE = new Map();
 const GLOBAL_LAST_DB_WRITE = new Map();
 const GLOBAL_WRITE_LOCK = new Map();
 const DNS_CACHE = new Map();
+let GLOBAL_REQ_COUNT = 0;
+let GLOBAL_LAST_REQ_WRITE = 0;
 
 // ==========================================================
 // ۲. ثوابت و تنظیمات اصلی (CONSTANTS)
@@ -29,6 +31,7 @@ const PRELOAD_RACE_DIAL = true;
 // ==========================================================
 export default {
   async fetch(request, env, ctx) {
+    trackRequest(env, ctx);
     await DbService.ensureSchema(env.DB);
     const url = new URL(request.url);
 
@@ -366,9 +369,9 @@ const Router = {
             ).bind(username).run();
             return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
           } else {
-            const { limit_gb, expiry_days, ips, tls, port, fingerprint } = body;
+            const { limit_gb, expiry_days, ips, tls, port, fingerprint, max_connections } = body;
             await env.DB.prepare(
-              "UPDATE users SET limit_gb = ?, expiry_days = ?, ips = ?, tls = ?, port = ?, fingerprint = ? WHERE username = ?"
+              "UPDATE users SET limit_gb = ?, expiry_days = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ? WHERE username = ?"
             ).bind(
               limit_gb ? parseFloat(limit_gb) : null, 
               expiry_days ? parseInt(expiry_days) : null, 
@@ -376,6 +379,7 @@ const Router = {
               tls, 
               port, 
               fingerprint || 'chrome',
+              max_connections ? parseInt(max_connections) : null,
               username
             ).run();
             return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
@@ -400,7 +404,33 @@ const Router = {
           
           let cfReqs = { today: 0, total: 0 };
           try {
-            cfReqs = await getCfUsage(env);
+            const liveCf = await getCfUsage(env);
+            const todayStr = new Date().toISOString().split('T')[0];
+            
+            const dateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
+            const totalRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_total'").first();
+            
+            let dbTotal = totalRow ? parseInt(totalRow.value) || 0 : 0;
+            let dbToday = 0;
+            
+            if (dateRow && dateRow.value === todayStr) {
+                const todayRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first();
+                dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
+            }
+            
+            if (liveCf.today > dbToday) {
+                dbToday = liveCf.today;
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(todayStr, todayStr).run();
+            }
+            
+            if (liveCf.total > dbTotal) {
+                dbTotal = liveCf.total;
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTotal), String(dbTotal)).run();
+            }
+            
+            cfReqs.today = dbToday + GLOBAL_REQ_COUNT;
+            cfReqs.total = dbTotal + GLOBAL_REQ_COUNT;
           } catch(e) {}
 
           return new Response(JSON.stringify({ 
@@ -417,14 +447,14 @@ const Router = {
         }
 
         if (request.method === 'POST') {
-          const { username, limit_gb, expiry_days, ips, tls, port, fingerprint } = await request.json();
+          const { username, limit_gb, expiry_days, ips, tls, port, fingerprint, max_connections } = await request.json();
           if (!username) {
             return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
           }
           const uuid = crypto.randomUUID();
           try {
             await env.DB.prepare(
-              "INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              "INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, max_connections) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ).bind(
               username, 
               uuid,
@@ -434,23 +464,22 @@ const Router = {
               atob('dmxlc3M='), 
               tls, 
               port,
-              fingerprint || 'chrome'
+              fingerprint || 'chrome',
+              max_connections ? parseInt(max_connections) : null
             ).run();
             return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
           } catch (err) {
-            let errorMsg = err.message;
-            if (errorMsg.includes("UNIQUE constraint failed")) {
-              errorMsg = "این نام کاربری از قبل وجود دارد.";
-            }
-            return new Response(JSON.stringify({ error: errorMsg }), { status: 500, headers: { "Content-Type": "application/json" } });
+            return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
           }
         }
       }
     }
 
-    return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
+    return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
   }
 };
+
+
 
 // ==========================================================
 // ۵. مدیریت دیتابیس و اعتبارسنجی (DATABASE SERVICE)
@@ -483,6 +512,7 @@ const DbService = {
     try { await db.prepare("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1").run(); } catch (e) {}
     try { await db.prepare("ALTER TABLE users ADD COLUMN last_active INTEGER").run(); } catch (e) {}
     try { await db.prepare("ALTER TABLE users ADD COLUMN fingerprint TEXT DEFAULT 'chrome'").run(); } catch (e) {}
+    try { await db.prepare("ALTER TABLE users ADD COLUMN max_connections INTEGER").run(); } catch (e) {}
     try { await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run(); } catch (e) {}
     schemaEnsured = true;
   },
@@ -1034,7 +1064,14 @@ async function handleVLESS(env, storedData = null, ctx = null) {
       isHeaderParsed = true;
 
       let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+      
+      if (user.max_connections && user.max_connections > 0 && activeCount >= user.max_connections) {
+        serverSock.close();
+        return;
+      }
+
       ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+      
       if (activeCount === 0) {
         const setOnlineTask = async () => {
           try {
@@ -1803,7 +1840,33 @@ function extractUUIDFromVless(data) {
   const hex = [...data.slice(1, 17)].map(b => b.toString(16).padStart(2, '0')).join('');
   return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
 }
+function trackRequest(env, ctx) {
+    GLOBAL_REQ_COUNT++;
+    const now = Date.now();
+    if (now - GLOBAL_LAST_REQ_WRITE > 15000 && GLOBAL_REQ_COUNT > 0) {
+        GLOBAL_LAST_REQ_WRITE = now;
+        const countToSave = GLOBAL_REQ_COUNT;
+        GLOBAL_REQ_COUNT = 0;
+        
+        const task = async () => {
+            try {
+                const today = new Date().toISOString().split('T')[0];
+                await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
+                
+                const lastDateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
+                if (!lastDateRow || lastDateRow.value !== today) {
+                    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
+                    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(countToSave), String(countToSave)).run();
+                } else {
+                    await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
+                }
+            } catch (e) {}
+        };
 
+        if (ctx) ctx.waitUntil(task());
+        else task();
+    }
+}
 // ==========================================================
 // ۹. پوسته ها و کدهای رابط کاربری (HTML TEMPLATES)
 // ==========================================================
@@ -2318,9 +2381,9 @@ const HTML_TEMPLATES = {
                         </div>
                     </div>
 
-                    <div class="grid grid-cols-2 gap-4">
+                    <div class="grid grid-cols-3 gap-4">
                         <div>
-                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">حجم مجاز (GB)</label>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">حجم (GB)</label>
                             <div class="relative">
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
@@ -2329,12 +2392,21 @@ const HTML_TEMPLATES = {
                             </div>
                         </div>
                         <div>
-                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">مدت اعتبار (روز)</label>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">اعتبار (روز)</label>
                             <div class="relative">
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                                 </span>
                                 <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">کاربر همزمان</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                                </span>
+                                <input type="number" id="input-max-connections" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                             </div>
                         </div>
                     </div>
@@ -2949,11 +3021,10 @@ const HTML_TEMPLATES = {
             const username = document.getElementById('input-name').value;
             const limit = document.getElementById('input-limit').value || null;
             const expiry = document.getElementById('input-expiry').value || null;
+            const maxConnections = document.getElementById('input-max-connections').value || null;
             
-            // Gather multiple selected ports
             const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value);
             
-            // Validation: Ensure at least one port is selected
             if (checkedPorts.length === 0) {
                 alert('⚠️ لطفا حداقل یک پورت را برای اتصال انتخاب کنید!');
                 submitButton.disabled = false;
@@ -2974,7 +3045,7 @@ const HTML_TEMPLATES = {
                 const response = await fetch(url, {
                     method: method,
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, tls, port, ips, fingerprint })
+                    body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, tls, port, ips, fingerprint, max_connections: maxConnections })
                 });
                 
                 if (response.ok) {
@@ -3313,13 +3384,6 @@ function closeUsageWarning() {
             });
         }
 
-        function showQR(encodedUsername) {
-            const username = decodeURIComponent(encodedUsername);
-            const link = getVlessLink(username);
-            if (!link) return;
-            toggleQRModal(true, link, 'QR کانفیگ VLESS');
-        }
-
         function editUser(encodedUsername) {
             const username = decodeURIComponent(encodedUsername);
             const user = window.allUsers.find(u => u.username === username);
@@ -3340,6 +3404,7 @@ function closeUsageWarning() {
 
             document.getElementById('input-limit').value = user.limit_gb || '';
             document.getElementById('input-expiry').value = user.expiry_days || '';
+            document.getElementById('input-max-connections').value = user.max_connections || '';
             document.getElementById('input-ips').value = user.ips || '';
 
             document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
@@ -3542,7 +3607,7 @@ function closeUsageWarning() {
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '1.3.6';
+const CURRENT_VERSION = '1.3.7';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 
 		async function checkForUpdates(isManual = false) {
