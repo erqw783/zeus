@@ -329,6 +329,7 @@ function getHtmlContent() {
                 </div>
             <h2 class="text-2xl font-black text-gray-900 dark:text-white mb-2">Zeus Auto Deployer</h2>
             <p class="text-sm font-medium text-gray-500 dark:text-zinc-400">نصب خودکار پنل زئوس روی کلودفلر</p>
+			<p class="text-sm font-medium text-gray-500 dark:text-zinc-400">🔥  روزانه 10 الی 100 گیگ کانفیگ رایگان  🔥</p>
         </div>
 
         <div class="space-y-5 relative z-10">
@@ -337,11 +338,13 @@ function getHtmlContent() {
             </a>
 <div class="mt-2 text-center mb-4">
     <p class="text-[11px] text-gray-500 dark:text-zinc-400 font-medium">
-        پس از ورود به کلودفلر، به انتهای صفحه بروید و روی دکمه آبی رنگ 
+        روی دکمه 
+        <span class="font-bold text-orange-500">دریافت توکن</span> 
+		کلیک کنید و پس از ورود به سایت در انتهای صفحه روی دکمه آبی رنگ 
         <span class="font-bold text-blue-500">Continue to summary</span> 
-        کلیک کنید.
+        کلیک کنید و توکن بسازید و آن را در کادر زیر وارد کنید.
     </p>
-</div>
+</div>   
             <div class="relative">
                 <input type="password" id="apiToken" placeholder="توکن خود را وارد کنید..." autocomplete="off" spellcheck="false" class="w-full pl-12 pr-4 py-3.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm font-mono text-left text-gray-900 dark:text-zinc-100 transition token-input" dir="ltr">
                 <button type="button" onclick="toggleToken()" class="absolute inset-y-0 left-0 flex items-center pl-4 text-gray-400 hover:text-gray-600 dark:hover:text-zinc-300 transition">
@@ -689,11 +692,13 @@ async function fetchPanelVersion(token, scriptName, latestVersion) {
             </a>
 <div class="mt-2 text-center mb-4">
     <p class="text-[11px] text-gray-500 dark:text-zinc-400 font-medium">
-        پس از ورود به کلودفلر، به انتهای صفحه بروید و روی دکمه آبی رنگ 
+        روی دکمه 
+        <span class="font-bold text-orange-500">دریافت توکن</span> 
+		کلیک کنید و پس از ورود به سایت در انتهای صفحه روی دکمه آبی رنگ 
         <span class="font-bold text-blue-500">Continue to summary</span> 
-        کلیک کنید.
+        کلیک کنید و توکن بسازید و آن را در کادر زیر وارد کنید.
     </p>
-</div>           
+</div>         
             <input type="password" id="updateApiToken" placeholder="توکن خود را وارد کنید..." autocomplete="off" spellcheck="false" class="w-full px-4 py-3 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm font-mono text-left text-gray-900 dark:text-zinc-100 transition" dir="ltr">
             
             <button id="checkPanelsBtn" onclick="checkExistingPanels()" class="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl text-md transition duration-300">
