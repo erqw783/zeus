@@ -9,6 +9,7 @@ const GLOBAL_LAST_ACTIVE_WRITE = new Map();
 const GLOBAL_LAST_DB_WRITE = new Map();
 const GLOBAL_WRITE_LOCK = new Map();
 const DNS_CACHE = new Map();
+const USER_REQ_CACHE = new Map();
 let GLOBAL_REQ_COUNT = 0;
 let GLOBAL_LAST_REQ_WRITE = 0;
 
@@ -154,7 +155,11 @@ const Router = {
         limit_gb: user.limit_gb,
         expiry_days: user.expiry_days,
         used_gb: user.used_gb,
+        limit_req: user.limit_req,
+        used_req: user.used_req,
         is_active: user.is_active,
+        online_count: ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0,
+        max_connections: user.max_connections,
         created_at: user.created_at,
         tls: user.tls,
         port: user.port,
@@ -369,12 +374,13 @@ const Router = {
             ).bind(username).run();
             return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
           } else {
-            const { limit_gb, expiry_days, ips, tls, port, fingerprint, max_connections } = body;
+            const { limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, max_connections } = body;
             await env.DB.prepare(
-              "UPDATE users SET limit_gb = ?, expiry_days = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ? WHERE username = ?"
+              "UPDATE users SET limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ? WHERE username = ?"
             ).bind(
               limit_gb ? parseFloat(limit_gb) : null, 
               expiry_days ? parseInt(expiry_days) : null, 
+              limit_req ? parseInt(limit_req) : null,
               ips || null, 
               tls, 
               port, 
@@ -399,7 +405,8 @@ const Router = {
           const now = Date.now();
           const enrichedUsers = (results || []).map(user => ({
             ...user,
-            is_online: (user.last_active && (now - user.last_active) < 65000) ? 1 : 0
+            is_online: (user.last_active && (now - user.last_active) < 65000) ? 1 : 0,
+            online_count: ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0
           }));
           
           let cfReqs = { today: 0, total: 0 };
@@ -447,19 +454,20 @@ const Router = {
         }
 
         if (request.method === 'POST') {
-          const { username, limit_gb, expiry_days, ips, tls, port, fingerprint, max_connections } = await request.json();
+          const { username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, max_connections } = await request.json();
           if (!username) {
             return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
           }
           const uuid = crypto.randomUUID();
           try {
             await env.DB.prepare(
-              "INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, max_connections) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              "INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ).bind(
               username, 
               uuid,
               limit_gb ? parseFloat(limit_gb) : null, 
               expiry_days ? parseInt(expiry_days) : null, 
+              limit_req ? parseInt(limit_req) : null,
               ips || null, 
               atob('dmxlc3M='), 
               tls, 
@@ -513,6 +521,8 @@ const DbService = {
     try { await db.prepare("ALTER TABLE users ADD COLUMN last_active INTEGER").run(); } catch (e) {}
     try { await db.prepare("ALTER TABLE users ADD COLUMN fingerprint TEXT DEFAULT 'chrome'").run(); } catch (e) {}
     try { await db.prepare("ALTER TABLE users ADD COLUMN max_connections INTEGER").run(); } catch (e) {}
+	try { await db.prepare("ALTER TABLE users ADD COLUMN limit_req INTEGER").run(); } catch (e) {}
+    try { await db.prepare("ALTER TABLE users ADD COLUMN used_req INTEGER DEFAULT 0").run(); } catch (e) {}
     try { await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run(); } catch (e) {}
     schemaEnsured = true;
   },
@@ -800,7 +810,8 @@ const SubscriptionService = {
 async function flushExpiredTraffic(env) {
   const now = Date.now();
   for (const [uname, cachedBytes] of GLOBAL_TRAFFIC_CACHE.entries()) {
-    if (cachedBytes <= 0) continue;
+    const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+    if (cachedBytes <= 0 && cachedReqs <= 0) continue;
     
     if (GLOBAL_WRITE_LOCK.get(uname)) continue;
 
@@ -810,10 +821,11 @@ async function flushExpiredTraffic(env) {
     if (activeCount <= 0 || (now - lastActive > 65000)) {
       GLOBAL_WRITE_LOCK.set(uname, true);
       GLOBAL_TRAFFIC_CACHE.set(uname, 0);
+      USER_REQ_CACHE.set(uname, 0);
       
       const deltaGb = cachedBytes / (1024 * 1024 * 1024);
       try {
-        await env.DB.prepare("UPDATE users SET used_gb = used_gb + ? WHERE username = ?").bind(deltaGb, uname).run();
+        await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, cachedReqs, uname).run();
       } catch (e) {
       } finally {
         GLOBAL_WRITE_LOCK.set(uname, false);
@@ -848,20 +860,22 @@ async function handleVLESS(env, storedData = null, ctx = null) {
     if (current >= thresholdBytes || (current > 0 && now - lastDbWrite > 60000)) {
         GLOBAL_WRITE_LOCK.set(username, true);
         let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+        let toCommitReq = USER_REQ_CACHE.get(username) || 0;
         
-        if (toCommit <= 0) {
+        if (toCommit <= 0 && toCommitReq <= 0) {
             GLOBAL_WRITE_LOCK.set(username, false);
             return;
         }
 
         GLOBAL_TRAFFIC_CACHE.set(username, 0);
+        USER_REQ_CACHE.set(username, 0);
         GLOBAL_LAST_DB_WRITE.set(username, now);
 
         let deltaGb = toCommit / (1024 * 1024 * 1024);
 
         let writeTask = async () => {
             try {
-                await env.DB.prepare("UPDATE users SET used_gb = used_gb + ? WHERE username = ?").bind(deltaGb, username).run();
+                await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, toCommitReq, username).run();
             } catch (e) {
             } finally {
                 GLOBAL_WRITE_LOCK.set(username, false);
@@ -887,16 +901,18 @@ async function handleVLESS(env, storedData = null, ctx = null) {
     if (activeCount <= 0) {
       ACTIVE_CONNECTIONS_COUNT.delete(uname);
       let cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
+      let cachedReqs = USER_REQ_CACHE.get(uname) || 0;
       
-      if (cachedBytes > 0 && !GLOBAL_WRITE_LOCK.get(uname)) {
+      if ((cachedBytes > 0 || cachedReqs > 0) && !GLOBAL_WRITE_LOCK.get(uname)) {
         GLOBAL_WRITE_LOCK.set(uname, true);
         GLOBAL_TRAFFIC_CACHE.set(uname, 0);
+        USER_REQ_CACHE.set(uname, 0);
         
         const deltaGb = cachedBytes / (1024 * 1024 * 1024);
         
         const writeTask = async () => {
           try {
-            await env.DB.prepare("UPDATE users SET used_gb = used_gb + ? WHERE username = ?").bind(deltaGb, uname).run();
+            await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, cachedReqs, uname).run();
           } catch (e) {
           } finally {
             GLOBAL_WRITE_LOCK.set(uname, false);
@@ -923,13 +939,16 @@ async function handleVLESS(env, storedData = null, ctx = null) {
         tickCount++;
         if (tickCount >= 4) {
           tickCount = 0;
-          const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, expiry_days, created_at FROM users WHERE uuid = ?").bind(validUUID).first();
+          const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at FROM users WHERE uuid = ?").bind(validUUID).first();
           
           let isExpired = false;
           if (!user || user.is_active === 0) {
             isExpired = true;
           } else {
             if (user.limit_gb && user.used_gb >= user.limit_gb) {
+              isExpired = true;
+            }
+            if (user.limit_req && (user.used_req + (USER_REQ_CACHE.get(username) || 0)) >= user.limit_req) {
               isExpired = true;
             }
             if (user.expiry_days && user.created_at) {
@@ -1047,6 +1066,10 @@ async function handleVLESS(env, storedData = null, ctx = null) {
         return;
       }
 
+      if (user.limit_req && (user.used_req + (USER_REQ_CACHE.get(user.username) || 0)) >= user.limit_req) {
+        serverSock.close();
+        return;
+      }
       if (user.expiry_days && user.created_at) {
         const created = new Date(user.created_at);
         const expiryDate = new Date(created.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
@@ -1062,6 +1085,9 @@ async function handleVLESS(env, storedData = null, ctx = null) {
       validUUID = reqUUID;
       username = user.username;
       isHeaderParsed = true;
+
+      let currentReqs = USER_REQ_CACHE.get(username) || 0;
+      USER_REQ_CACHE.set(username, currentReqs + 1);
 
       let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
       
@@ -2134,12 +2160,16 @@ const HTML_TEMPLATES = {
                     <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v1.2.5</span>
                 </h1>
                 <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-sm flex-shrink-0 w-fit">
-                    <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" rel="noopener noreferrer" class="text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Github">
+                    <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" rel="noopener noreferrer" class="text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="GitHub">
                         <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
-                            <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0012 2z"/>
+                            <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
                         </svg>
                     </a>
-                    <span class="w-px h-4 bg-gray-300 dark:bg-zinc-700 flex-shrink-0"></span>
+                    <a href="https://www.youtube.com/@MacanDev" target="_blank" rel="noopener noreferrer" class="text-red-500 hover:text-red-600 dark:hover:text-red-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="YouTube">
+                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .5 6.186C0 8.07 0 12 0 12s0 3.93.5 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.378.505 9.378.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+                        </svg>
+                    </a>
                     <a href="https://t.me/EzAccess1" target="_blank" rel="noopener noreferrer" class="text-sky-500 hover:text-sky-600 dark:hover:text-sky-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Telegram">
                         <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
@@ -2312,13 +2342,15 @@ const HTML_TEMPLATES = {
         <div id="users-table-container" class="hidden overflow-x-auto border border-gray-200 dark:border-amoled-border rounded-xl bg-white dark:bg-amoled-card">
             <table class="w-full text-right border-collapse">
                 <thead>
-                    <tr class="bg-gray-100 dark:bg-zinc-900/50 border-b border-gray-200 dark:border-amoled-border text-xs text-gray-500 dark:text-gray-400">
+                    <tr class="bg-gray-100 dark:bg-zinc-900/50 border-b border-gray-200 dark:border-amoled-border text-xs text-gray-500 dark:text-gray-400 text-center">
                         <th class="p-4">نام کاربر و عملیات</th>
                         <th class="p-4">لینک ساب</th>
                         <th class="p-4">پروتکل</th>
-                        <th class="p-4">پورت (TLS)</th>
+                        <th class="p-4">پورت</th>
                         <th class="p-4">وضعیت حجم</th>
-                        <th class="p-4">وضعیت اعتبار</th>
+                        <th class="p-4">وضعیت ریکوئست</th>
+                        <th class="p-4">وضعیت زمان</th>
+                        <th class="p-4">کاربران آنلاین</th>
                         <th class="p-4">تاریخ ساخت</th>
                     </tr>
                 </thead>
@@ -2382,7 +2414,7 @@ const HTML_TEMPLATES = {
                         </div>
                     </div>
 
-                    <div class="grid grid-cols-3 gap-4">
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
                         <div>
                             <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">حجم (GB)</label>
                             <div class="relative">
@@ -2399,6 +2431,15 @@ const HTML_TEMPLATES = {
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                                 </span>
                                 <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">سقف ریکوئست</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                </span>
+                                <input type="number" id="input-req-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                             </div>
                         </div>
                         <div>
@@ -2884,57 +2925,108 @@ const HTML_TEMPLATES = {
 
                     const usedGb = user.used_gb || 0;
                     const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
-
-                    let volumeHtml = '';
-                    if (user.limit_gb) {
-                        const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
-                        const limitHue = 120 - (limitPercent * 1.2);
-                        const formattedLimit = user.limit_gb < 1 ? (user.limit_gb * 1024).toFixed(0) + ' MB' : user.limit_gb + ' GB';
-                        volumeHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[130px]">' +
-                            '<div class="flex justify-between text-[11px] text-gray-500 dark:text-gray-400 font-medium">' +
-                                '<span>مصرف: ' + formattedUsed + '</span>' +
-                                '<span>کل: ' + formattedLimit + '</span>' +
-                            '</div>' +
-                            '<div class="w-full bg-gray-200 dark:bg-zinc-700 rounded-full h-1.5 overflow-hidden">' +
-                                '<div class="h-1.5 rounded-full transition-all duration-500" style="width: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
-                            '</div>' +
-                        '</div>';
-                    } else {
-                        volumeHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[130px]">' +
-                            '<div class="flex justify-between text-[11px] text-gray-500 dark:text-gray-400 font-medium">' +
-                                '<span>مصرف: ' + formattedUsed + '</span>' +
-                                '<span>کل: نامحدود</span>' +
-                            '</div>' +
-                            '<div class="w-full bg-gray-200 dark:bg-zinc-700 rounded-full h-1.5 overflow-hidden">' +
-                                '<div class="bg-blue-500 h-1.5 rounded-full transition-all duration-500" style="width: 100%"></div>' +
-                            '</div>' +
-                        '</div>';
-                    }
-
-                    let expiryHtml = '';
-                    if (user.expiry_days) {
-                        const expiryHue = daysPercent * 1.2;
-                        expiryHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[130px]">' +
-                            '<div class="flex justify-between text-[11px] text-gray-500 dark:text-gray-400 font-medium">' +
-                                '<span>باقی‌مانده: ' + daysRemaining + ' روز</span>' +
-                                '<span>کل: ' + user.expiry_days + ' روز</span>' +
-                            '</div>' +
-                            '<div class="w-full bg-gray-200 dark:bg-zinc-700 rounded-full h-1.5 overflow-hidden flex justify-end">' +
-                                '<div class="h-1.5 rounded-full transition-all duration-500" style="width: ' + daysPercent + '%; background-color: hsl(' + expiryHue + ', 80%, 45%)"></div>' +
-                            '</div>' +
-                        '</div>';
-                    } else {
-                        expiryHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[130px]">' +
-                            '<div class="flex justify-between text-[11px] text-gray-500 dark:text-gray-400 font-medium">' +
-                                '<span>باقی‌مانده: نامحدود</span>' +
-                                '<span>کل: نامحدود</span>' +
-                            '</div>' +
-                            '<div class="w-full bg-gray-200 dark:bg-zinc-700 rounded-full h-1.5 overflow-hidden flex justify-end">' +
-                                '<div class="bg-blue-500 h-1.5 rounded-full transition-all duration-500" style="width: 100%"></div>' +
-                            '</div>' +
-                        '</div>';
-                    }
-
+                    
+					const usedReq = user.used_req || 0;
+					let reqHtml = '';
+					if (user.limit_req) {
+					    const reqPercent = Math.min((usedReq / user.limit_req) * 100, 100);
+					    const reqHue = 120 - (reqPercent * 1.2);
+					    reqHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + usedReq.toLocaleString() + '</span>' +
+					            '<span class="leading-none">کل: ' + user.limit_req.toLocaleString() + '</span>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    reqHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + usedReq.toLocaleString() + '</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					        '</div>' +
+					    '</div>';
+					}
+					
+					let volumeHtml = '';
+					if (user.limit_gb) {
+					    const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
+					    const limitHue = 120 - (limitPercent * 1.2);
+					    const formattedLimit = user.limit_gb < 1 ? (user.limit_gb * 1024).toFixed(0) + ' MB' : user.limit_gb + ' GB';
+					    volumeHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + formattedUsed + '</span>' +
+					            '<span class="leading-none">کل: ' + formattedLimit + '</span>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    volumeHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مصرف: ' + formattedUsed + '</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					        '</div>' +
+					    '</div>';
+					}
+					
+					let expiryHtml = '';
+					if (user.expiry_days) {
+					    const expiryHue = daysPercent * 1.2;
+					    expiryHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + daysPercent + '%; background-color: hsl(' + expiryHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مانده: ' + daysRemaining + ' روز</span>' +
+					            '<span class="leading-none">کل: ' + user.expiry_days + ' روز</span>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    expiryHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full bg-blue-500 rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">مانده: نامحدود</span>' +
+					            '<span class="leading-none">کل: نامحدود</span>' +
+					        '</div>' +
+					    '</div>';
+					}
+					
+					const onlineCount = user.online_count || 0;
+					let onlineHtml = '';
+					if (user.max_connections) {
+					    const onlinePercent = Math.min((onlineCount / user.max_connections) * 100, 100);
+					    const onlineHue = 120 - (onlinePercent * 1.2);
+					    onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full rounded-full transition-all duration-500" style="height: ' + onlinePercent + '%; background-color: hsl(' + onlineHue + ', 80%, 45%)"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
+					            '<span class="leading-none">سقف: ' + user.max_connections + '</span>' +
+					        '</div>' +
+					    '</div>';
+					} else {
+					    onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
+					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
+					            '<div class="w-full ' + (onlineCount > 0 ? 'bg-emerald-500' : 'bg-gray-400') + ' rounded-full transition-all duration-500" style="height: 100%"></div>' +
+					        '</div>' +
+					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
+					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
+					            '<span class="leading-none">سقف: نامحدود</span>' +
+					        '</div>' +
+					    '</div>';
+					}
                     const statusBtnColor = user.is_active === 0 ? 'text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/30' : 'text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/30';
                     const statusBtnTitle = user.is_active === 0 ? 'فعال کردن کاربر' : 'قطع کردن کاربر';
                     const statusBtnIcon = user.is_active === 0 
@@ -2947,7 +3039,7 @@ const HTML_TEMPLATES = {
                                     '<div class="flex items-center gap-2">' +
                                         '<span class="font-bold text-gray-900 dark:text-zinc-100">' + user.username + '</span>' +
                                         (user.is_active === 0 ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 rounded-md">قطع</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 rounded-md">فعال</span>') +
-                                        (user.is_online === 1 ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-emerald-500 text-white rounded-md animate-pulse">● آنلاین</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded-md">آفلاین</span>') +
+                                        (user.is_online === 1 ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-emerald-500 text-white rounded-md animate-pulse" dir="rtl">● آنلاین (' + (user.online_count || 0) + (user.max_connections ? '/' + user.max_connections : '') + ')</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded-md">آفلاین</span>') +
                                     '</div>' +
                                     '<div class="flex gap-1.5">' +
                                         '<button onclick="copyConfig(\\'' + encodeURIComponent(user.username) + '\\')" title="کپی کانفیگ" class="p-1.5 bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-md transition shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
@@ -2999,7 +3091,9 @@ const HTML_TEMPLATES = {
                                 '</div>' +
                             '</td>' +
                             '<td class="p-4">' + volumeHtml + '</td>' +
+                            '<td class="p-4">' + reqHtml + '</td>' +
                             '<td class="p-4">' + expiryHtml + '</td>' +
+                            '<td class="p-4">' + onlineHtml + '</td>' +
                             '<td class="p-4 text-xs text-gray-500">' + createdDate + '</td>' +
                         '</tr>';
                 }).join('');
@@ -3033,6 +3127,7 @@ const HTML_TEMPLATES = {
             const username = document.getElementById('input-name').value;
             const limit = document.getElementById('input-limit').value || null;
             const expiry = document.getElementById('input-expiry').value || null;
+            const reqLimit = document.getElementById('input-req-limit').value || null;
             const maxConnections = document.getElementById('input-max-connections').value || null;
             
             const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value);
@@ -3057,7 +3152,7 @@ const HTML_TEMPLATES = {
                 const response = await fetch(url, {
                     method: method,
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, tls, port, ips, fingerprint, max_connections: maxConnections })
+					body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, max_connections: maxConnections })
                 });
                 
                 if (response.ok) {
@@ -3424,8 +3519,8 @@ function openUsageWarning() {
 
             document.getElementById('input-limit').value = user.limit_gb || '';
             document.getElementById('input-expiry').value = user.expiry_days || '';
+            document.getElementById('input-req-limit').value = user.limit_req || '';
             document.getElementById('input-max-connections').value = user.max_connections || '';
-            document.getElementById('input-ips').value = user.ips || '';
 
             document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
 
@@ -3627,7 +3722,7 @@ function openUsageWarning() {
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '1.3.9';
+const CURRENT_VERSION = '1.4.2';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 
 		async function checkForUpdates(isManual = false) {
@@ -3857,7 +3952,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 <svg class="w-9 h-9" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
             </div>
             <h1 class="text-xl font-bold tracking-tight text-gray-900 dark:text-white mb-1">پنل زئوس - وضعیت اشتراک</h1>
-            <p id="display-username" class="text-sm font-bold text-blue-500 tracking-wide font-mono"></p>
+            <p id="display-username" class="text-sm font-bold text-blue-500 tracking-wide font-mono mb-2"></p>
+            <div id="live-connections-badge" class="hidden inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-500 rounded-full text-xs font-bold shadow-sm">
+                <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span id="live-connections-text" dir="rtl">۰ دستگاه متصل</span>
+            </div>
         </div>
 
         <!-- Connection Status -->
@@ -3900,6 +3999,40 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
                     <span>باقی‌مانده: <span id="days-remaining" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
                     <span>کل اعتبار: <span id="total-days" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                </div>
+            </div>
+
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
+                        <svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                        وضعیت ریکوئست‌ها
+                    </span>
+                    <span id="req-pct" class="text-xs font-bold text-emerald-500">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden mb-3">
+                    <div id="req-progress" class="bg-emerald-600 h-2.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
+                    <span>مصرف شده: <span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                    <span>سقف کل: <span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
+                </div>
+            </div>
+
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
+                <div class="flex justify-between items-center mb-3">
+                    <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
+                        <svg class="w-4 h-4 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                        دستگاه‌های متصل
+                    </span>
+                    <span id="online-pct" class="text-xs font-bold text-sky-500">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-2.5 overflow-hidden mb-3">
+                    <div id="online-progress" class="bg-sky-600 h-2.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-500 dark:text-zinc-400 font-medium">
+                    <span>متصل در لحظه: <span id="online-count" class="font-bold text-gray-800 dark:text-zinc-200">۰</span></span>
+                    <span>سقف همزمان: <span id="limit-online" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
                 </div>
             </div>
         </div>
@@ -4031,6 +4164,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
             document.getElementById('display-username').innerText = u.username;
 
+            const badge = document.getElementById('live-connections-badge');
+            badge.classList.remove('hidden');
+            if (u.online_count && u.online_count > 0) {
+                document.getElementById('live-connections-text').innerText = u.online_count + (u.max_connections ? '/' + u.max_connections : '') + ' دستگاه متصل';
+                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-500 rounded-full text-xs font-bold shadow-sm';
+                badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
+            } else {
+                document.getElementById('live-connections-text').innerText = '۰ دستگاه متصل';
+                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-gray-500/10 border border-gray-500/20 text-gray-500 dark:text-zinc-400 rounded-full text-xs font-bold shadow-sm';
+                badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-gray-500';
+            }
+
             // Compute volume
             const usedGb = u.used_gb || 0;
             const limitGb = u.limit_gb;
@@ -4087,7 +4232,47 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('days-remaining').innerText = daysRemaining === 'نامحدود' ? 'نامحدود' : daysRemaining + ' روز';
             document.getElementById('total-days').innerText = totalDays;
 
-            // Set Status
+            const usedReq = u.used_req || 0;
+            const limitReq = u.limit_req;
+            document.getElementById('used-req').innerText = usedReq.toLocaleString();
+            
+            let isReqExpired = false;
+            if (limitReq) {
+                document.getElementById('limit-req').innerText = limitReq.toLocaleString();
+                const rPct = Math.min((usedReq / limitReq) * 100, 100);
+                document.getElementById('req-pct').innerText = rPct.toFixed(0) + '٪';
+                document.getElementById('req-progress').style.width = rPct + '%';
+                
+                const rHue = 120 - (rPct * 1.2);
+                document.getElementById('req-progress').style.backgroundColor = 'hsl(' + rHue + ', 80%, 45%)';
+                
+                if (usedReq >= limitReq) isReqExpired = true;
+            } else {
+                document.getElementById('limit-req').innerText = 'نامحدود';
+                document.getElementById('req-pct').innerText = '۰٪';
+                document.getElementById('req-progress').style.width = '100%';
+                document.getElementById('req-progress').style.backgroundColor = '#10b981';
+            }
+
+            const onlineCount = u.online_count || 0;
+            const maxConns = u.max_connections;
+            document.getElementById('online-count').innerText = onlineCount;
+            
+            if (maxConns) {
+                document.getElementById('limit-online').innerText = maxConns;
+                const oPct = Math.min((onlineCount / maxConns) * 100, 100);
+                document.getElementById('online-pct').innerText = oPct.toFixed(0) + '٪';
+                document.getElementById('online-progress').style.width = oPct + '%';
+                
+                const oHue = 120 - (oPct * 1.2);
+                document.getElementById('online-progress').style.backgroundColor = 'hsl(' + oHue + ', 80%, 45%)';
+            } else {
+                document.getElementById('limit-online').innerText = 'نامحدود';
+                document.getElementById('online-pct').innerText = '۰٪';
+                document.getElementById('online-progress').style.width = '100%';
+                document.getElementById('online-progress').style.backgroundColor = onlineCount > 0 ? '#0ea5e9' : '#9ca3af'; 
+            }
+
             const statusCard = document.getElementById('status-card');
             const statusText = document.getElementById('status-text');
             
@@ -4098,6 +4283,9 @@ document.addEventListener('DOMContentLoaded', () => {
             } else if (isVolumeExpired) {
                 statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
                 statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن حجم مجاز';
+            } else if (isReqExpired) {
+                statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
+                statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن ریکوئست مجاز';
             } else if (isTimeExpired) {
                 statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
                 statusText.innerText = '⏳ وضعیت اشتراک: منقضی شده (پایان زمان اعتبار)';
