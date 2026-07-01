@@ -188,6 +188,78 @@ const Router = {
 				},
 			});
 		}
+		if (url.pathname === "/api/recover" && request.method === "POST") {
+			const { api_token } = await request.json();
+			if (!api_token) {
+				return new Response(JSON.stringify({ error: "Token is required" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			try {
+				const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+					headers: { "Authorization": "Bearer " + api_token }
+				});
+				const cfData = await cfRes.json();
+				if (!cfRes.ok || !cfData.success) {
+					return new Response(JSON.stringify({ error: "Invalid or expired Cloudflare token" }), {
+						status: 401,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					});
+				}
+				const host = url.hostname;
+				let isAuthorized = false;
+				if (host.endsWith(".workers.dev")) {
+					const parts = host.split(".");
+					const targetSubdomain = parts[parts.length - 3];
+					const accountsRes = await fetch("https://api.cloudflare.com/client/v4/accounts", {
+						headers: { "Authorization": "Bearer " + api_token }
+					});
+					const accountsData = await accountsRes.json();
+					if (accountsData.success && accountsData.result) {
+						for (const acc of accountsData.result) {
+							const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.id}/workers/subdomain`, {
+								headers: { "Authorization": "Bearer " + api_token }
+							});
+							const subData = await subRes.json();
+							if (subData.success && subData.result && subData.result.subdomain === targetSubdomain) {
+								isAuthorized = true;
+								break;
+							}
+						}
+					}
+				} else {
+					const zonesRes = await fetch("https://api.cloudflare.com/client/v4/zones", {
+						headers: { "Authorization": "Bearer " + api_token }
+					});
+					const zonesData = await zonesRes.json();
+					if (zonesData.success && zonesData.result) {
+						for (const zone of zonesData.result) {
+							if (host === zone.name || host.endsWith("." + zone.name)) {
+								isAuthorized = true;
+								break;
+							}
+						}
+					}
+				}
+				if (!isAuthorized) {
+					return new Response(JSON.stringify({ error: "این توکن متعلق به صاحب پنل نیست (ای کــثـــکـــش)" }), {
+						status: 403,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					});
+				}
+				await env.DB.prepare("DELETE FROM settings WHERE key = 'panel_password'").run();
+				cachedPanelPassword = null;
+				return new Response(JSON.stringify({ success: true }), {
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			} catch (err) {
+				return new Response(JSON.stringify({ error: "Cloudflare API connection error" }), {
+					status: 500,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+		}
 		const authorized = await DbService.verifyApiAuth(request, env);
 		if (!authorized) {
 			return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -1893,7 +1965,8 @@ const HTML_TEMPLATES = {
     </script>
 </body>
 </html>`,
-	login: `<!DOCTYPE html>
+
+login: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
     <meta charset="UTF-8">
@@ -1915,15 +1988,40 @@ const HTML_TEMPLATES = {
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
     <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl p-6">
-        <h2 class="text-xl font-bold mb-2 text-center text-blue-600 dark:text-blue-400">ورود به پنل مدیریت</h2>
-        <p class="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">برای دسترسی به پنل مدیریت، رمز عبور خود را وارد کنید.</p>
-        <form onsubmit="handleLogin(event)" class="space-y-4">
-            <div>
-                <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
-                <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required>
+        <div id="login-section">
+            <h2 class="text-xl font-bold mb-6 text-center text-blue-600 dark:text-blue-400">ورود به پنل مدیریت</h2>
+            <form onsubmit="handleLogin(event)" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
+                    <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required>
+                </div>
+                <button type="submit" id="submit-btn" class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition font-bold">ورود</button>
+            </form>
+            <div class="mt-4 text-center">
+                <button onclick="toggleRecovery(true)" class="text-xs text-blue-500 hover:text-blue-600 transition font-medium">بازیابی رمز پنل</button>
             </div>
-            <button type="submit" id="submit-btn" class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition font-bold">ورود</button>
-        </form>
+        </div>
+        <div id="recovery-section" class="hidden">
+            <h2 class="text-xl font-bold mb-4 text-center text-orange-600 dark:text-orange-400">بازیابی رمز پنل</h2>
+            
+            <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-xl text-xs leading-relaxed text-orange-800 dark:text-orange-300">
+                برای احراز هویت و اثبات مالکیت پنل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
+                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg font-bold transition shadow-md shadow-orange-500/20">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                    دریافت توکن
+                </a>
+            </div>
+
+            <form onsubmit="handleRecovery(event)" class="space-y-4">
+                <div>
+                    <input type="password" id="api-token" placeholder="توکن را وارد کنید" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs text-center font-mono" required>
+                </div>
+                <div class="flex gap-2 pt-2">
+                    <button type="button" onclick="toggleRecovery(false)" class="w-1/3 py-2.5 bg-gray-200 dark:bg-zinc-800 hover:bg-gray-300 dark:hover:bg-zinc-700 text-gray-700 dark:text-zinc-300 font-medium rounded-lg text-sm transition">انصراف</button>
+                    <button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-orange-600 hover:bg-orange-700 text-white font-medium rounded-lg text-sm transition font-bold">بازیابی رمز پنل</button>
+                </div>
+            </form>
+        </div>
     </div>
     <script>
         async function handleLogin(event) {
@@ -1931,7 +2029,6 @@ const HTML_TEMPLATES = {
             const password = document.getElementById('password').value;
             const btn = document.getElementById('submit-btn');
             btn.disabled = true;
-            btn.innerText = 'در حال بررسی...';
             try {
                 const res = await fetch('/api/login', {
                     method: 'POST',
@@ -1942,18 +2039,46 @@ const HTML_TEMPLATES = {
                 if (res.ok && data.success) {
                     window.location.reload();
                 } else {
-                    alert('❌ رمز عبور اشتباه است!');
+                    alert('رمز عبور اشتباه است');
                 }
             } catch (err) {
                 alert('خطا در ارتباط با سرور');
             } finally {
                 btn.disabled = false;
-                btn.innerText = 'ورود';
+            }
+        }
+        function toggleRecovery(show) {
+            document.getElementById('login-section').classList.toggle('hidden', show);
+            document.getElementById('recovery-section').classList.toggle('hidden', !show);
+        }
+        async function handleRecovery(event) {
+            event.preventDefault();
+            const apiToken = document.getElementById('api-token').value;
+            const btn = document.getElementById('recover-btn');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/recover', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_token: apiToken })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('رمز عبور با موفقیت حذف شد. در حال انتقال به صفحه تنظیمات اولیه...');
+                    window.location.reload();
+                } else {
+                    alert(data.error || 'خطا در تایید اطلاعات');
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
             }
         }
     </script>
 </body>
 </html>`,
+
 	panel: `
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -3826,7 +3951,7 @@ function editUser(encodedUsername) {
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '1.5.3';
+const CURRENT_VERSION = '1.5.4';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		async function checkForUpdates(isManual = false) {
             try {
