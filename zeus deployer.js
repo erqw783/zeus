@@ -3,7 +3,7 @@ export default {
 		const url = new URL(request.url);
 		if (request.method === "GET" && url.pathname === "/") {
 			return new Response(getHtmlContent(), {
-				headers: { "Content-Type": "text/html;charset=UTF-8" },
+				headers: { "Content-Type": "text/htmll001;charset=UTF-8" },
 			});
 		}
 		if (request.method === "POST" && url.pathname === "/api/deploy") {
